@@ -10,6 +10,7 @@ from config import Config
 from strategies.smc_strategies import SMCStrategies
 from risk.risk_manager import RiskManager
 from trading.trade_manager import TradeManager
+from trade_history import TradeHistory
 
 class EURUSD_SMC_Bot:
     """Multi-Symbol SMC Trading Bot - Direct MT5 Connection"""
@@ -44,6 +45,7 @@ class EURUSD_SMC_Bot:
         # Setup logging
         self.setup_logging()
         self.trade_manager = TradeManager(self.logger)
+        self.trade_history = TradeHistory()
         
     def setup_logging(self):
         """Configure logging"""
@@ -91,6 +93,14 @@ class EURUSD_SMC_Bot:
             self.logger.info(f"   Equity: R{account_info.equity:.2f}")
             self.logger.info(f"   Server: {account_info.server}")
             self.logger.info(f"   Leverage: 1:{account_info.leverage}")
+            
+            # Check AutoTrading status
+            if not account_info.trade_allowed:
+                self.logger.error("*** CRITICAL: AUTOTRADING IS DISABLED ***")
+                self.logger.error("Fix: Enable AutoTrading in MT5 (Tools > Options > Expert Advisors)")
+                self.logger.info("=" * 60)
+                return False
+            
             self.logger.info("=" * 60)
             return True
         else:
@@ -162,7 +172,7 @@ class EURUSD_SMC_Bot:
         }
     
     def generate_signal(self, data):
-        """Generate trading signal using SMC"""
+        """Generate trading signal using SMC with BOS + ChoCH confirmation"""
         df_m15 = data['m15']
         df_h1 = data['h1']
         current_ask = data['ask']
@@ -170,16 +180,30 @@ class EURUSD_SMC_Bot:
         symbol = data['symbol']
         pv = data['pip_value']
         
-        # Get SMC concepts (pass pip_value for correct pip calculation)
+        # Get SMC concepts
         order_blocks = self.strategies.identify_order_blocks(df_m15, pv)
         fvgs = self.strategies.identify_fair_value_gaps(df_m15, pv)
         trend_h1 = self.strategies.analyze_trend(df_h1)
         trend_m15 = self.strategies.analyze_trend(df_m15)
         
+        # NEW: Check for Break of Structure confirmation
+        bos_h1 = self.strategies.detect_break_of_structure(df_h1, pv)
+        
+        # NEW: Check for Change of Character (avoid trading during reversals)
+        choch_h1 = self.strategies.detect_change_of_character(df_h1, pv)
+        if choch_h1:
+            self.logger.info(f"[{symbol}] ChoCH detected ({choch_h1['reason']}) - skipping scalp signals")
+            return None
+        
+        # NEW: Get liquidity pools
+        buy_liquidity = self.strategies.identify_liquidity_pools(df_h1, direction='buy', pip_value=pv)
+        
         signals = []
         
-        # BUY SIGNAL - require strong bullish H1 trend and at least neutral M15
-        if trend_h1['trend'] == 'bullish' and trend_h1['score'] >= 3 and trend_m15['trend'] in ['bullish', 'ranging']:
+        # BUY SIGNAL - require bullish H1 trend, BOS confirmation, and OB+FVG alignment
+        if (trend_h1['trend'] == 'bullish' and trend_h1['score'] >= 3 and 
+            trend_m15['trend'] in ['bullish', 'ranging'] and bos_h1 and bos_h1['type'] == 'bullish'):
+            
             for ob in order_blocks:
                 if ob['type'] == 'bullish':
                     dist_to_ob = (current_ask - ob['price']) / pv
@@ -196,6 +220,10 @@ class EURUSD_SMC_Bot:
                                             current_ask, stop_loss, 'buy', pv
                                         )
                                         
+                                        # Calculate confidence with liquidity
+                                        liquidity_strength = len(buy_liquidity)
+                                        confidence = (ob['strength'] * fvg['size']) * (1 + liquidity_strength * 0.1)
+                                        
                                         signals.append({
                                             'direction': 'buy',
                                             'price': current_ask,
@@ -205,12 +233,15 @@ class EURUSD_SMC_Bot:
                                             'stop_pips': stop_pips,
                                             'ob_price': ob['price'],
                                             'fvg_mid': fvg['mid'],
-                                            'confidence': ob['strength'] * fvg['size'],
+                                            'confidence': confidence,
+                                            'bos_confirmed': True,
                                             'symbol': symbol,
                                         })
         
-        # SELL SIGNAL - require strong bearish H1 trend and at least neutral M15
-        if trend_h1['trend'] == 'bearish' and trend_h1['score'] >= 3 and trend_m15['trend'] in ['bearish', 'ranging']:
+        # SELL SIGNAL - require bearish H1 trend, BOS confirmation, and OB+FVG alignment
+        if (trend_h1['trend'] == 'bearish' and trend_h1['score'] >= 3 and 
+            trend_m15['trend'] in ['bearish', 'ranging'] and bos_h1 and bos_h1['type'] == 'bearish'):
+            
             for ob in order_blocks:
                 if ob['type'] == 'bearish':
                     dist_to_ob = (ob['price'] - current_bid) / pv
@@ -237,6 +268,7 @@ class EURUSD_SMC_Bot:
                                             'ob_price': ob['price'],
                                             'fvg_mid': fvg['mid'],
                                             'confidence': ob['strength'] * fvg['size'],
+                                            'bos_confirmed': True,
                                             'symbol': symbol,
                                         })
         
@@ -247,18 +279,24 @@ class EURUSD_SMC_Bot:
             self.logger.info(
                 f"[{symbol}] Signal generated: {best['direction'].upper()} at {best['price']:.5f} "
                 f"SL {best['sl']:.5f} ({best['stop_pips']:.1f} pips) "
-                f"trend_h1={trend_h1['trend']} ob={best['ob_price']:.5f} fvg_mid={best['fvg_mid']:.5f}"
+                f"trend_h1={trend_h1['trend']} BOS_confirmed"
             )
             return best
 
+        reason = "No valid signal"
+        if not bos_h1:
+            reason = "No BOS detected"
+        elif choch_h1:
+            reason = f"ChoCH detected - reversal risk"
+        
         self.logger.info(
-            f"[{symbol}] No valid signal (trend_h1={trend_h1['trend']}, "
+            f"[{symbol}] {reason} (trend_h1={trend_h1['trend']}, "
             f"OBs={len(order_blocks)}, FVGs={len(fvgs)})"
         )
         return None
 
     def generate_swing_signal(self, data):
-        """Generate swing trading signal using H1 entry / H4+D1 bias."""
+        """Generate swing trading signal with BOS, ChoCH, and Liquidity confirmation"""
         df_h1 = data['h1']
         df_h4 = data['h4']
         df_d1 = data['d1']
@@ -272,13 +310,28 @@ class EURUSD_SMC_Bot:
         fvgs = self.strategies.identify_fair_value_gaps_swing(df_h1, pv)
         trend_d1 = self.strategies.analyze_trend(df_d1)
         trend_h4 = self.strategies.analyze_trend(df_h4)
-
+        
+        # NEW: BOS confirmation on H4
+        bos_h4 = self.strategies.detect_break_of_structure(df_h4, pv)
+        
+        # NEW: ChoCH check
+        choch_h4 = self.strategies.detect_change_of_character(df_h4, pv)
+        if choch_h4:
+            self.logger.info(f"[{symbol}] Swing ChoCH detected - skipping swing signals")
+            return None
+        
+        # NEW: Breaker block detection (avoid trading over broken levels)
+        breakers = self.strategies.identify_breaker_blocks(df_h1, pv)
+        
         signals = []
 
         cfg = self.config
 
-        # SWING BUY - D1 bullish, H4 supportive
-        if trend_d1['trend'] == 'bullish' and trend_d1['score'] >= 3 and trend_h4['trend'] in ['bullish', 'ranging']:
+        # SWING BUY - D1 bullish, H4 supportive, BOS confirmed
+        if (trend_d1['trend'] == 'bullish' and trend_d1['score'] >= 3 and 
+            trend_h4['trend'] in ['bullish', 'ranging'] and 
+            bos_h4 and bos_h4['type'] == 'bullish'):
+            
             for ob in order_blocks:
                 if ob['type'] == 'bullish':
                     dist = (current_ask - ob['price']) / pv
@@ -290,24 +343,37 @@ class EURUSD_SMC_Bot:
                                 if cfg.SWING_MIN_STOP_PIPS <= stop_pips <= cfg.SWING_MAX_STOP_PIPS:
                                     volume = round(max(cfg.SWING_FIXED_LOT_SIZE, 0.01), 2)
                                     risk = current_ask - stop_loss
-                                    signals.append({
-                                        'direction': 'buy',
-                                        'price': current_ask,
-                                        'sl': stop_loss,
-                                        'tp1': current_ask + risk * cfg.SWING_TP1_MULTIPLIER,
-                                        'tp2': current_ask + risk * cfg.SWING_TP2_MULTIPLIER,
-                                        'tp3': current_ask + risk * cfg.SWING_TP3_MULTIPLIER,
-                                        'volume': volume,
-                                        'stop_pips': stop_pips,
-                                        'ob_price': ob['price'],
-                                        'fvg_mid': fvg['mid'],
-                                        'confidence': ob['strength'] * fvg['size'],
-                                        'trade_type': 'SWING',
-                                        'symbol': symbol,
-                                    })
+                                    
+                                    # Check for breaker resistance above
+                                    breaker_risk = False
+                                    for breaker in breakers:
+                                        if breaker['type'] == 'bearish_breaker' and breaker['level'] > current_ask:
+                                            if (breaker['level'] - current_ask) / pv < stop_pips * 2:
+                                                breaker_risk = True
+                                    
+                                    if not breaker_risk:
+                                        signals.append({
+                                            'direction': 'buy',
+                                            'price': current_ask,
+                                            'sl': stop_loss,
+                                            'tp1': current_ask + risk * cfg.SWING_TP1_MULTIPLIER,
+                                            'tp2': current_ask + risk * cfg.SWING_TP2_MULTIPLIER,
+                                            'tp3': current_ask + risk * cfg.SWING_TP3_MULTIPLIER,
+                                            'volume': volume,
+                                            'stop_pips': stop_pips,
+                                            'ob_price': ob['price'],
+                                            'fvg_mid': fvg['mid'],
+                                            'confidence': ob['strength'] * fvg['size'],
+                                            'trade_type': 'SWING',
+                                            'bos_confirmed': True,
+                                            'symbol': symbol,
+                                        })
 
-        # SWING SELL - D1 bearish, H4 supportive
-        if trend_d1['trend'] == 'bearish' and trend_d1['score'] >= 3 and trend_h4['trend'] in ['bearish', 'ranging']:
+        # SWING SELL - D1 bearish, H4 supportive, BOS confirmed
+        if (trend_d1['trend'] == 'bearish' and trend_d1['score'] >= 3 and 
+            trend_h4['trend'] in ['bearish', 'ranging'] and
+            bos_h4 and bos_h4['type'] == 'bearish'):
+            
             for ob in order_blocks:
                 if ob['type'] == 'bearish':
                     dist = (ob['price'] - current_bid) / pv
@@ -319,21 +385,31 @@ class EURUSD_SMC_Bot:
                                 if cfg.SWING_MIN_STOP_PIPS <= stop_pips <= cfg.SWING_MAX_STOP_PIPS:
                                     volume = round(max(cfg.SWING_FIXED_LOT_SIZE, 0.01), 2)
                                     risk = stop_loss - current_bid
-                                    signals.append({
-                                        'direction': 'sell',
-                                        'price': current_bid,
-                                        'sl': stop_loss,
-                                        'tp1': current_bid - risk * cfg.SWING_TP1_MULTIPLIER,
-                                        'tp2': current_bid - risk * cfg.SWING_TP2_MULTIPLIER,
-                                        'tp3': current_bid - risk * cfg.SWING_TP3_MULTIPLIER,
-                                        'volume': volume,
-                                        'stop_pips': stop_pips,
-                                        'ob_price': ob['price'],
-                                        'fvg_mid': fvg['mid'],
-                                        'confidence': ob['strength'] * fvg['size'],
-                                        'trade_type': 'SWING',
-                                        'symbol': symbol,
-                                    })
+                                    
+                                    # Check for breaker support below
+                                    breaker_risk = False
+                                    for breaker in breakers:
+                                        if breaker['type'] == 'bullish_breaker' and breaker['level'] < current_bid:
+                                            if (current_bid - breaker['level']) / pv < stop_pips * 2:
+                                                breaker_risk = True
+                                    
+                                    if not breaker_risk:
+                                        signals.append({
+                                            'direction': 'sell',
+                                            'price': current_bid,
+                                            'sl': stop_loss,
+                                            'tp1': current_bid - risk * cfg.SWING_TP1_MULTIPLIER,
+                                            'tp2': current_bid - risk * cfg.SWING_TP2_MULTIPLIER,
+                                            'tp3': current_bid - risk * cfg.SWING_TP3_MULTIPLIER,
+                                            'volume': volume,
+                                            'stop_pips': stop_pips,
+                                            'ob_price': ob['price'],
+                                            'fvg_mid': fvg['mid'],
+                                            'confidence': ob['strength'] * fvg['size'],
+                                            'trade_type': 'SWING',
+                                            'bos_confirmed': True,
+                                            'symbol': symbol,
+                                        })
 
         if signals:
             signals.sort(key=lambda x: x['confidence'], reverse=True)
@@ -341,7 +417,7 @@ class EURUSD_SMC_Bot:
             self.logger.info(
                 f"[{symbol}] SWING signal: {best['direction'].upper()} at {best['price']:.5f} "
                 f"SL {best['sl']:.5f} ({best['stop_pips']:.1f} pips) "
-                f"trend_d1={trend_d1['trend']} trend_h4={trend_h4['trend']}"
+                f"trend_d1={trend_d1['trend']} BOS_confirmed"
             )
             return best
 
@@ -352,6 +428,16 @@ class EURUSD_SMC_Bot:
         sym = signal.get('symbol', self.config.SYMBOL)
         sym_state = self.symbol_state.get(sym, {})
         trade_type = signal.get('trade_type', 'SCALP')
+
+        # Pre-execution validation
+        account_info = mt5.account_info()
+        if not account_info.trade_allowed:
+            self.logger.error(f"[{sym}] AUTOTRADING DISABLED - Cannot execute trade")
+            return False
+        
+        if account_info.balance < 100:
+            self.logger.error(f"[{sym}] INSUFFICIENT BALANCE (R{account_info.balance:.2f}) - Cannot trade")
+            return False
 
         # Per-symbol daily limit check
         if trade_type == 'SWING':
@@ -391,12 +477,30 @@ class EURUSD_SMC_Bot:
             }
             self.positions.append(position)
             
+            # Save to trade history
+            self.trade_history.save_executed_trade({
+                'ticket': result['ticket'],
+                'symbol': sym,
+                'direction': signal['direction'],
+                'entry_price': signal['price'],
+                'volume': signal['volume'],
+                'stop_loss': signal['sl'],
+                'tp1': signal['tp1'],
+                'tp2': signal['tp2'],
+                'tp3': signal['tp3'],
+                'stop_pips': signal.get('stop_pips', 0),
+                'confidence': signal.get('confidence', 0),
+                'trade_type': trade_type,
+                'bos_confirmed': signal.get('bos_confirmed', False),
+            })
+            
             # Log trade
             price_fmt = '.3f' if sym_state.get('pip_value', 0.0001) == 0.01 else '.5f'
             self.logger.info("\n" + "=" * 60)
             self.logger.info(f"TRADE EXECUTED - LIVE ACCOUNT [{trade_type}] {sym}")
             self.logger.info(f"   Ticket: {result['ticket']}")
             self.logger.info(f"   Symbol: {sym}")
+            self.logger.info(f"   Account Balance: R{account_info.balance:.2f}")
             self.logger.info(f"   Direction: {signal['direction'].upper()}")
             self.logger.info(f"   Entry: {signal['price']:{price_fmt}}")
             self.logger.info(f"   SL: {signal['sl']:{price_fmt}} ({signal['stop_pips']:.1f} pips)")
@@ -436,12 +540,39 @@ class EURUSD_SMC_Bot:
                         profit = 0
                 except Exception:
                     profit = 0
+                close_reason = "WIN" if profit >= 0 else "LOSS"
                 if profit >= 0:
                     self.wins += 1
                     self.logger.info(f"[{sym}] Position {position['ticket']}: CLOSED WIN (R{profit:.2f})")
                 else:
                     self.losses += 1
                     self.logger.info(f"[{sym}] Position {position['ticket']}: CLOSED LOSS (R{profit:.2f})")
+                
+                # Calculate exit price and pips from history
+                try:
+                    deals = mt5.history_deals_get(position=position['ticket'])
+                    if deals and len(deals) >= 2:
+                        exit_price = deals[-1].price
+                        if position['direction'] == 'buy':
+                            pips_closed = (exit_price - position['price']) / pv
+                        else:
+                            pips_closed = (position['price'] - exit_price) / pv
+                    else:
+                        exit_price = 0
+                        pips_closed = 0
+                except:
+                    exit_price = 0
+                    pips_closed = 0
+                
+                # Save closed trade to history
+                self.trade_history.save_closed_trade(
+                    ticket=position['ticket'],
+                    exit_price=exit_price,
+                    profit_loss=round(profit, 2),
+                    pips_gained=round(pips_closed, 2),
+                    close_reason=close_reason
+                )
+                
                 self.positions.remove(position)
                 continue
                 
@@ -467,19 +598,51 @@ class EURUSD_SMC_Bot:
             if position['direction'] == 'buy' and current_price >= position['tp1'] and not position['tp1_hit']:
                 position['tp1_hit'] = True
                 self.logger.info(f"[{sym}] Position {position['ticket']}: TP1 Hit (+{position['stop_pips'] * 1.5:.1f} pips)")
+                # Update trade history with TP1 milestone
+                self.trade_history.save_closed_trade(
+                    ticket=position['ticket'],
+                    exit_price=position['tp1'],
+                    profit_loss=round(position['stop_pips'] * 1.5 * (0.0001 if 'JPY' in sym else 0.00001), 2),
+                    pips_gained=round(position['stop_pips'] * 1.5, 2),
+                    close_reason="TP1"
+                )
                 
             elif position['direction'] == 'sell' and current_price <= position['tp1'] and not position['tp1_hit']:
                 position['tp1_hit'] = True
                 self.logger.info(f"[{sym}] Position {position['ticket']}: TP1 Hit (+{position['stop_pips'] * 1.5:.1f} pips)")
+                # Update trade history with TP1 milestone
+                self.trade_history.save_closed_trade(
+                    ticket=position['ticket'],
+                    exit_price=position['tp1'],
+                    profit_loss=round(position['stop_pips'] * 1.5 * (0.0001 if 'JPY' in sym else 0.00001), 2),
+                    pips_gained=round(position['stop_pips'] * 1.5, 2),
+                    close_reason="TP1"
+                )
             
             # Check TP2
             if position['direction'] == 'buy' and current_price >= position['tp2'] and not position['tp2_hit']:
                 position['tp2_hit'] = True
                 self.logger.info(f"[{sym}] Position {position['ticket']}: TP2 Hit (+{position['stop_pips'] * 2.0:.1f} pips)")
+                # Update trade history with TP2 milestone
+                self.trade_history.save_closed_trade(
+                    ticket=position['ticket'],
+                    exit_price=position['tp2'],
+                    profit_loss=round(position['stop_pips'] * 2.0 * (0.0001 if 'JPY' in sym else 0.00001), 2),
+                    pips_gained=round(position['stop_pips'] * 2.0, 2),
+                    close_reason="TP2"
+                )
                 
             elif position['direction'] == 'sell' and current_price <= position['tp2'] and not position['tp2_hit']:
                 position['tp2_hit'] = True
                 self.logger.info(f"[{sym}] Position {position['ticket']}: TP2 Hit (+{position['stop_pips'] * 2.0:.1f} pips)")
+                # Update trade history with TP2 milestone
+                self.trade_history.save_closed_trade(
+                    ticket=position['ticket'],
+                    exit_price=position['tp2'],
+                    profit_loss=round(position['stop_pips'] * 2.0 * (0.0001 if 'JPY' in sym else 0.00001), 2),
+                    pips_gained=round(position['stop_pips'] * 2.0, 2),
+                    close_reason="TP2"
+                )
     
     def print_status(self, symbol_data_list):
         """Print real-time status for all symbols"""
@@ -553,7 +716,9 @@ class EURUSD_SMC_Bot:
                                 self.execute_signal(signal)
                         else:
                             remaining = 300 - (now - last_sig).seconds
-                            self.logger.info(f"[{symbol}] Cooldown: {remaining}s")
+                            # Log cooldown every 60 seconds instead of every 2 seconds
+                            if remaining % 60 == 0:
+                                self.logger.info(f"[{symbol}] Scalp cooldown: {remaining}s")
 
                     # ── Swing signals (no session filter) ──
                     swing_spread_ok = data['spread'] <= sym_cfg.get('swing_max_spread', self.config.SWING_MAX_SPREAD_PIPS)
@@ -568,7 +733,9 @@ class EURUSD_SMC_Bot:
                                         self.execute_signal(swing_signal)
                             else:
                                 remaining = self.config.SWING_COOLDOWN_SECONDS - (now - last_swing).seconds
-                                self.logger.info(f"[{symbol}] Swing cooldown: {remaining}s")
+                                # Log swing cooldown every 300 seconds instead of every 2 seconds
+                                if remaining % 300 == 0:
+                                    self.logger.info(f"[{symbol}] Swing cooldown: {remaining}s")
                 
                 # Manage open positions (all symbols)
                 self.manage_positions()

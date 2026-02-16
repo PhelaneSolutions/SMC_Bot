@@ -15,22 +15,42 @@ class RiskManager:
     def calculate_position_size(self, stop_loss_pips, pip_value=None):
         """Calculate lot size.
 
-        If FIXED_LOT_SIZE is set (> 0), always use that.
+        If FIXED_LOT_SIZE is set (> 0), use that if account allows.
         Otherwise fall back to risk-based sizing.
+        Implements minimum safety checks for small accounts.
         """
+
+        balance = self.get_account_balance()
+        pv = pip_value or self.config.PIP_VALUE
+        
+        # Safety check: warn if balance critically low
+        if balance < 100:
+            import logging
+            logger = logging.getLogger('SMC_Bot')
+            logger.warning(f"⚠️  Account balance critically low: R{balance:.2f}. Position sizing disabled.")
+            return 0.00  # Don't trade if balance too low
 
         # Fixed lot size mode (e.g. 0.02 lots every trade)
         if getattr(self.config, "FIXED_LOT_SIZE", 0) and self.config.FIXED_LOT_SIZE > 0:
-            return round(self.config.FIXED_LOT_SIZE, 2)
+            fixed_size = self.config.FIXED_LOT_SIZE
+            # Validate fixed size doesn't risk too much on small account
+            pip_value_per_lot = 6.5 if pv == 0.01 else 10.0
+            max_risk_per_trade = balance * 0.05  # Max 5% risk
+            risk_for_fixed = (fixed_size * stop_loss_pips * pip_value_per_lot)
+            
+            if risk_for_fixed > max_risk_per_trade:
+                # Scale down for safety
+                scaled_size = (max_risk_per_trade / (stop_loss_pips * pip_value_per_lot))
+                return round(max(scaled_size, 0.01), 2)
+            
+            return round(fixed_size, 2)
 
         # Risk-based sizing fallback
-        pv = pip_value or self.config.PIP_VALUE
-        balance = self.get_account_balance()
         risk_amount = balance * self.config.RISK_PERCENT
 
         # Approximate pip value per standard lot
-        # For EURUSD/AUDUSD (pip=0.0001): ~$10 per pip per lot
-        # For GBPJPY (pip=0.01): ~$6.50 per pip per lot (varies with JPY rate)
+        # For EURUSD/AUDUSD (pip=0.0001): ~10 ZAR per pip per lot (adjusted for ZAR account)
+        # For GBPJPY (pip=0.01): ~6.5 ZAR per pip per lot (varies with JPY rate)
         pip_value_per_lot = 6.5 if pv == 0.01 else 10.0
         position_size = risk_amount / (stop_loss_pips * pip_value_per_lot)
 

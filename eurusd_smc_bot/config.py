@@ -12,13 +12,13 @@ class Config:
     
     # ── Symbols to trade ──
     SYMBOLS = {
-        "EURUSD": {"pip_value": 0.0001, "max_spread": 2.0, "swing_max_spread": 3.0},
-        "GBPJPY": {"pip_value": 0.01,   "max_spread": 3.0, "swing_max_spread": 4.0},
-        "AUDUSD": {"pip_value": 0.0001, "max_spread": 2.0, "swing_max_spread": 3.0},
+        "EURUSD.ecn": {"pip_value": 0.0001, "max_spread": 2.0, "swing_max_spread": 3.0},
+        "GBPJPY.ecn": {"pip_value": 0.01,   "max_spread": 3.0, "swing_max_spread": 4.0},
+        "AUDUSD.ecn": {"pip_value": 0.0001, "max_spread": 2.0, "swing_max_spread": 3.0},
     }
 
     # Legacy single-symbol fallback (kept for compatibility)
-    SYMBOL = "EURUSD"
+    SYMBOL = "EURUSD.ecn"
     PIP_VALUE = 0.0001
     
     # SMC Parameters
